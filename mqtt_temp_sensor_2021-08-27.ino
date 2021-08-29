@@ -25,15 +25,14 @@
 #include <Ethernet.h>
 #include <PubSubClient.h>
 #include <OneWire.h>
-//#include <math.h>
 
 #include "arduino_secrets.h" 
 
 
-#define APP_VERSION  "0.1.0"
+#define APP_VERSION  "0.3.0"
 #define APP_AUTHOR   "Grant Phillips"
 #define APP_CREATED  "17 Aug 2021"
-#define APP_BUILT    "27 Aug 2021"
+#define APP_BUILT    "28 Aug 2021"
 
 
 // ------------------------
@@ -56,17 +55,17 @@ char ssid[] = SECRET_SSID;       // your network SSID (name)
 char pass[] = SECRET_PASS;       // your network password (use for WPA, or use as key for WEP)
 int status = WL_IDLE_STATUS;     // the WiFi radio's status
 
-// Update these with values suitable for your network.
-byte mac[]    = { 0xF0, 0x08, 0xD1, 0xCB, 0x51, 0xD0 };
-
 #define MQTT_BROKER_IP_NUMBER "10.0.0.234"
 #define MQTT_BROKER_PORT      1883
 
-#define MQTT_MY_ID                        "arduinoClient"
+#define MQTT_MY_ID                        "arduino_office"
 #define MQTT_TOPIC_ARDUINO_IN             "arduino/in"
 #define MQTT_TOPIC_ARDUINO_CONNECTED      "arduino/connected"
 #define MQTT_TOPIC_ARDUINO_WIFI_STRENGTH  "arduino/wifi/strength"
 #define MQTT_TOPIC_ARDUINO_TEMP           "arduino/temp"
+#define MQTT_TOPIC_ARDUINO_STATUS         "arduino/status"
+
+#define MY_LOCATION                       "Office"
 
 // OneWire stuff for the Temperature Sensor
 //const int PIN_LED =  7;         // the number of the LED pin
@@ -83,16 +82,26 @@ unsigned long lastDebounceTime = 0; //last time the pin was toggled, used to kee
 unsigned long debounceDelay = 50;   //the debounce time which user sets prior to run
 #define MAX_PIN 24
 int lastButtonStates[MAX_PIN];
+char macBuffer[20];
+char hexChars[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
 
 long tickCounter = 0;
 char buffer[20];
+char jsonBuffer[300];
+char myipString[20];
+char tempSensorChip[10];
+char location[30];
+long wifiStrength = 0;
+float tempReading = -999;
+IPAddress myip;
 
 unsigned long previousTime;
 bool ledState = false;
 
 void callback(char* topic, byte* payload, unsigned int length) 
 {
+  flashLed(3);
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("] ");
@@ -113,7 +122,8 @@ void reconnect()
   while (!client.connected()) 
   {
     Serial.println("Attempting MQTT connection...");
-    
+    flashLed(2);
+
     // Attempt to connect
     Serial.print("client.connect ... ");
     if (client.connect(MQTT_MY_ID, MQTT_USERNAME, MQTT_PASSWORD)) 
@@ -145,6 +155,9 @@ void reconnect()
       snooze(5);
     }
   }
+  Serial.println("reconnected to MQTT ok");
+
+  flashLed(10);
 }
 
 void snooze(int seconds)
@@ -168,7 +181,19 @@ void setup()
     delay(SLEEPY_TIME_MINI);
     // wait for serial port to connect. Needed for native USB port only
   }
-  Serial.println(" debug ok");
+  Serial.println("Debug ok");
+
+  for (int i=0; i < sizeof(tempSensorChip); i++)
+  {
+    tempSensorChip[i] = '\0';
+  }
+
+  for (int i=0; i < sizeof(macBuffer); i++)
+  {
+    macBuffer[i] = '\0'; 
+  }
+
+  strcpy(location, MY_LOCATION);
 
   // ----------------------------
   // initialise the array that tracks the Button states
@@ -204,7 +229,7 @@ void setup()
   // attempt to connect to WiFi network:
   while (status != WL_CONNECTED) 
   {
-    Serial.print("Attempting to connect to WPA SSID: ");
+    Serial.print("Attempting to connect to WiFi: ");
     Serial.println(ssid);
     
     // Connect to WPA/WPA2 network:
@@ -214,12 +239,12 @@ void setup()
   }
 
   // you're connected now, so print out the data:
-  Serial.print("You're connected to the network");
+  Serial.println("You are connected to the network.");
   printCurrentNet();
   printWifiData();
   
   // --------
-  Serial.print("client.setClient(wifiClient) ... ");
+  Serial.print("MQTT client.setClient(wifiClient) ... ");
   client.setClient(wifiClient);
   Serial.println("done.");
 
@@ -235,8 +260,18 @@ void setup()
   client.setCallback(callback);
   Serial.println(" done.");
 
+  flashLed(10);
+  
   // Allow the hardware to sort itself out
   snooze(2);
+
+    if (!client.connected()) 
+  {
+    reconnect();
+  }
+
+  Serial.println("-------------------------");
+  Serial.println("Ready.");
 }
 
 void loop() 
@@ -249,7 +284,7 @@ void loop()
   }
 
   // ------------------------------
-  // read the button pin, if pressed will be high, if not pressed will be low
+  // read the button state (Pressed or Unpressed)
   int lastButtonState = lastButtonStates[buttonPin];
   int buttonState = readButtonState(buttonPin);
   if (buttonState != lastButtonState)
@@ -267,13 +302,15 @@ void loop()
     }
   }
   
-  //set the LED
+  // set the LED
   digitalWrite(ledPin, ledState);
 
   // ------------------------------
   unsigned long currentTime = millis();
   
-  if ((currentTime < previousTime) or 
+  if ((tickCounter == 0) or 
+      (buttonState == BUTTON_PRESSED) or
+      (currentTime < previousTime) or 
       (currentTime - previousTime >= SENSOR_PUBLISH_FREQUENCY))
   {
     // sleepytime has been reached
@@ -316,22 +353,38 @@ int readButtonState(int buttonPin)
   return thisButtonState;
 }
 
+void flashLed(int flashes)
+{
+  for (int i=0; i < flashes; i++)
+  {
+      delay(200);
+      digitalWrite(ledPin, ON);
+      delay(200);
+      digitalWrite(ledPin, OFF);
+  }
+}
+
 void publishSensorData()
 {
-  
+  flashLed(2); 
   publishWiFiStrength();
+
+  flashLed(2); 
   publishTemp();  
+
+  flashLed(2); 
+  publishStatus();
 }
 
 void publishWiFiStrength()
 {
     // get the WiFi signal strength:
-    long rssi = WiFi.RSSI();
+    wifiStrength = WiFi.RSSI();
     
     // Serial.print("signal strength (RSSI):");
-    // Serial.println(rssi);
+    // Serial.println(wifiStrength);
   
-    ltoa(rssi, buffer, 10);
+    ltoa(wifiStrength, buffer, 10);
  
     // Publish my Wifi status/strength
     Serial.print("publish to ");
@@ -346,7 +399,7 @@ void publishWiFiStrength()
 void publishTemp()
 {
     Serial.println("Read Temp from sensor:");
-    float tempReading = readSensor();
+    tempReading = readSensor();
 
     if (tempReading <= -100)
     {
@@ -368,21 +421,108 @@ void publishTemp()
     Serial.println("done.");
 }
 
-void printWifiData() {
+void publishStatus()
+{
+    Serial.println("publishStatus:");
+    
+    String tempString = String(tempReading, 1);
+    tempString.toCharArray(buffer, sizeof(buffer));
+
+    //Serial.println(tempString);
+    
+    /*
+     * 
+     * this is too big
+     * max length is around 230 characters
+{
+  "client_name": "Arduino Office",
+  "app_version": "0.2.0",
+  "app_built": "28 Aug 2021",
+  "ip": "10.0.0.212",
+  "mac": "F0:08:D1:CB:51:D0",
+  "wifi_strength": "-64",
+  "temperature_celsius": "18.6",
+  "temperature_chip": "DS18B20",
+  "tick_counter": 75,
+  "led_state": "on",
+  "button_state": "pressed",
+  "pin_temp_sensor": 3,
+  "pin_button": 2,
+  "pin_led": 7,
+  "mqtt_broker_host": "10.0.0.234",
+  "mqtt_broker_port": 1883
+}
+
+    */ 
+    Serial.println(MQTT_MY_ID);
+    Serial.println(APP_VERSION);
+    Serial.println(APP_BUILT);
+    Serial.println(location);
+    Serial.println(myipString);
+    Serial.println(macBuffer);
+    Serial.println(wifiStrength);
+    Serial.println(buffer);
+    Serial.println(tempSensorChip);
+    Serial.println(tickCounter);
+    Serial.println();
+    Serial.println("sprintf ...");
+    sprintf(jsonBuffer, "{\"name\": \"%s\",\"version\": \"%s\",\"built\": \"%s\",\"loc\": \"%s\",\"ip\": \"%s\",\"mac\": \"%s\",\"wifi\": \"%d\",\"temp\": \"%s\",\"sensor\": \"%s\",\"ticks\": \"%d\",\"led\": \"%s\",\"btn\": \"%s\"}",
+      MQTT_MY_ID,
+      APP_VERSION,
+      APP_BUILT,
+      location,
+      myipString,
+      macBuffer,
+      wifiStrength,
+      buffer,
+      tempSensorChip,
+      tickCounter,
+      ledState ? "on" : "off",
+      buttonState == BUTTON_PRESSED ? "pressed" : "unpressed"
+    );
+
+    // Publish the temperature from the sensor
+    Serial.print("publish to ");
+    Serial.println(MQTT_TOPIC_ARDUINO_STATUS);
+    Serial.println(strlen(jsonBuffer));
+    Serial.println(jsonBuffer);
+    client.publish(MQTT_TOPIC_ARDUINO_STATUS, jsonBuffer);
+    Serial.println("Done.");
+}
+
+void printWifiData() 
+{
   // print your board's IP address:
-  IPAddress ip = WiFi.localIP();
+  myip = WiFi.localIP();
+  sprintf(myipString, "%d.%d.%d.%d", myip[0], myip[1], myip[2], myip[3]);
+  
   Serial.print("IP Address: ");
-  Serial.println(ip);
-  Serial.println(ip);
+  Serial.println(myip);
 
   // print your MAC address:
   byte mac[6];
   WiFi.macAddress(mac);
+  
+  int macBufferIndex = 0;
+  for (int i = sizeof(mac)-1; i >= 0; i--) 
+  {
+    byte x = mac[i] >> 4;
+    byte y = mac[i] % 16;
+
+    macBuffer[macBufferIndex++] = hexChars[x];
+    macBuffer[macBufferIndex++] = hexChars[y];
+    if (i > 0) 
+    {
+      macBuffer[macBufferIndex++] = ':';
+    }
+  }
+  
   Serial.print("MAC address: ");
   printMacAddress(mac);
 }
 
-void printCurrentNet() {
+void printCurrentNet() 
+{
   // print the SSID of the network you're attached to:
   Serial.print("SSID: ");
   Serial.println(WiFi.SSID());
@@ -429,7 +569,7 @@ float readSensor()
   byte type_s;
   byte data[12];
   byte addr[8];
-  float celsius, fahrenheit;
+  float celsius; //, fahrenheit;
   
   Serial.println("Read Temp Sensor");
   if ( !ds.search(addr)) 
@@ -441,12 +581,13 @@ float readSensor()
     return -100;
   }
   
-  Serial.print("ROM =");
+  Serial.print("  ROM =");
   for( i = 0; i < 8; i++) 
   {
     Serial.write(' ');
     Serial.print(addr[i], HEX);
   }
+  Serial.println();
 
   if (OneWire::crc8(addr, 7) != addr[7]) 
   {
@@ -455,21 +596,41 @@ float readSensor()
   }
  
   // the first ROM byte indicates which chip
-  switch (addr[0]) {
+  switch (addr[0]) 
+  {
     case 0x10:
-      Serial.println("  Chip = DS18S20");  // or old DS1820
+      if (tempSensorChip[0] == '\0')
+      {
+        strcpy(tempSensorChip, "DS18S20");
+        Serial.println("  Chip = DS18S20");  // or old DS1820
+      }
       type_s = 1;
       break;
+      
     case 0x28:
-      Serial.println("  Chip = DS18B20");
+      if (tempSensorChip[0] == '\0')
+      {
+        strcpy(tempSensorChip, "DS18B20");
+        Serial.println("  Chip = DS18B20");
+      }
       type_s = 0;
       break;
+      
     case 0x22:
-      Serial.println("  Chip = DS1822");
+      if (tempSensorChip[0] == '\0')
+      {
+        strcpy(tempSensorChip, "DS1822");
+        Serial.println("  Chip = DS1822");
+      }
       type_s = 0;
       break;
+      
     default:
-      Serial.println("Device is not a DS18x20 family device.");
+      if (tempSensorChip[0] == '\0')
+      {
+        strcpy(tempSensorChip, "Unknown");
+        Serial.println("Device is not a DS18x20 family device.");
+      }
       return -102;
   } 
 
@@ -525,7 +686,7 @@ float readSensor()
   celsius = (float)raw / 16.0;
   Serial.print("  Temperature = ");
   Serial.print(celsius);
-  Serial.print(" Celsius, ");
+  Serial.println(" Celsius");
 
   return celsius;
 }
